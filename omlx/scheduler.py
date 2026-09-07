@@ -741,7 +741,7 @@ def _patched_generation_batch_step(self):
         and self.uids
     ):
         deltas = [model._uid_rope_deltas.get(uid, 0.0) for uid in self.uids]
-        model.set_batch_rope_deltas(mx.array(deltas))
+        _bind_step_rope_deltas(model, mx.array(deltas), self.uids)
 
     # Defensive: mlx-lm's GenerationBatch._step does `any(self.logits_processors)`
     # and `for p in self.logits_processors[e]`, both of which crash when a row
@@ -1415,6 +1415,37 @@ def _bind_text_prefill_rope_delta(model: Any, delta: float) -> None:
     generic_setter = getattr(model, "set_batch_rope_deltas", None)
     if callable(generic_setter):
         generic_setter(mx.array([delta]))
+
+
+def _mark_text_positions(model: Any, request: Any, uid: int) -> None:
+    """Hand a text-proven request's batch uid to the adapter after insert().
+
+    The prefill chunks run under a temporary uid, so they only record the
+    proof on the request (``text_positions_proven``); once the batch
+    generator has assigned the real uid, the adapter learns it here and its
+    batch-one decode / MTP verify steps keep Qwen4's rank-two positions.
+    """
+
+    if not getattr(request, "text_positions_proven", False):
+        return
+    marker = getattr(type(model), "mark_text_positions", None)
+    if callable(marker):
+        marker(model, uid)
+
+
+def _bind_step_rope_deltas(model: Any, deltas: mx.array, uids) -> None:
+    """Bind per-row rope deltas for one decode step, uid-aware when possible.
+
+    ``VLMModelAdapter.set_step_rope_deltas`` keeps a text-proven batch-one
+    request on Qwen4's rank-two positions; other wrappers keep the generic
+    ``set_batch_rope_deltas`` binder.
+    """
+
+    step_setter = getattr(type(model), "set_step_rope_deltas", None)
+    if callable(step_setter):
+        step_setter(model, deltas, list(uids))
+        return
+    model.set_batch_rope_deltas(deltas)
 
 
 def _vlm_extra_seq_slice(val: mx.array, s: slice) -> mx.array:
@@ -3673,6 +3704,7 @@ class Scheduler:
                         self.model,
                         getattr(request, "rope_deltas", 0.0),
                     )
+                    request.text_positions_proven = True
                 if embeds_array is not None and embeds_array.shape[1] > 0:
                     model_kwargs["inputs_embeds"] = embeds_array[:, :n_to_process]
                     if extra_kwargs:
@@ -5442,6 +5474,7 @@ class Scheduler:
                 self.model,
                 getattr(state.request, "rope_deltas", 0.0),
             )
+            state.request.text_positions_proven = True
             if self._supports_skip_lm_head():
                 self.model(chunk, cache=state.cache, skip_lm_head=True)
             else:
@@ -5677,6 +5710,7 @@ class Scheduler:
             if vlm_mtp_uid is not None:
                 self.request_id_to_uid[request.request_id] = vlm_mtp_uid
                 self.uid_to_request_id[vlm_mtp_uid] = request.request_id
+                _mark_text_positions(self.model, request, vlm_mtp_uid)
                 now = time.monotonic()
                 request.batch_uid = vlm_mtp_uid
                 request.status = RequestStatus.RUNNING
@@ -5723,6 +5757,7 @@ class Scheduler:
 
             if hasattr(self.model, "register_rope_delta"):
                 self.model.register_rope_delta(uid, request.rope_deltas)
+            _mark_text_positions(self.model, request, uid)
 
             self.total_prompt_tokens += request.num_prompt_tokens
             cache_info = (
@@ -11137,6 +11172,7 @@ class Scheduler:
                 # Register per-UID rope_delta for mRoPE decode.
                 if hasattr(self.model, "register_rope_delta"):
                     self.model.register_rope_delta(uid, request.rope_deltas)
+                _mark_text_positions(self.model, request, uid)
 
                 self.total_prompt_tokens += request.num_prompt_tokens
                 cache_info = (

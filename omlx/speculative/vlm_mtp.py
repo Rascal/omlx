@@ -253,6 +253,29 @@ class _VLMAdapterMTPProxy:
     def __call__(self, *args: Any, **kwargs: Any) -> Any:
         return self._adapter(*args, **kwargs)
 
+    # The scheduler and MTP binders resolve these seams on the *class* (to
+    # keep auto-created mock attributes from posing as capabilities), so
+    # ``__getattr__`` delegation is not enough: define them here and forward
+    # to the adapter when it has them, else fall back to the generic binder.
+    def set_step_rope_deltas(self, deltas: Any, uids: Any) -> None:
+        setter = getattr(type(self._adapter), "set_step_rope_deltas", None)
+        if callable(setter):
+            setter(self._adapter, deltas, uids)
+        else:
+            self._adapter.set_batch_rope_deltas(deltas)
+
+    def mark_text_positions(self, uid: Any) -> None:
+        marker = getattr(type(self._adapter), "mark_text_positions", None)
+        if callable(marker):
+            marker(self._adapter, uid)
+
+    def set_text_prefill_rope_delta(self, delta: Any) -> None:
+        setter = getattr(type(self._adapter), "set_text_prefill_rope_delta", None)
+        if callable(setter):
+            setter(self._adapter, delta)
+        else:
+            self._adapter.set_batch_rope_deltas(mx.array([delta]))
+
 
 class _MTPResetBindingProxy:
     """Temporarily expose ``language_model`` during drafter reset."""

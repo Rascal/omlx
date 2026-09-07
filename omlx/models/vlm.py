@@ -22,10 +22,29 @@ Architecture:
 import logging
 from typing import Any, Dict, List, Optional
 
+import os
+
 import mlx.core as mx
 import mlx.nn as nn
 
 logger = logging.getLogger(__name__)
+
+
+# OMLX_QWEN4_STEP_TEXT_POSITIONS=0 keeps decode/MTP-verify steps on the generic
+# rank-three mRoPE positions (which also keeps Qwen4's gathered-QSA arms off
+# those rows); the scheduler-proven prefill positions are unaffected.
+_STEP_TEXT_POSITIONS_DISABLED = os.environ.get(
+    "OMLX_QWEN4_STEP_TEXT_POSITIONS", "1"
+).strip().lower() in {"0", "false", "no", "off"}
+# Below this many cached tokens the backbone's decode/verify rows keep the generic
+# form. With the row gather on the cache's own layout the gathered-QSA arms
+# measured -1.6% serial at 5k (noise) and +6% at 41k, +13% at 82k, +35% at 206k
+# on an M5 Max (adaptive MTP with sampling: +2..+3% at 5k/41k, +12% at 82k,
+# +23% at 206k), so the crossover sits around 20-30k. The scheduler-proven
+# prefill positions are not subject to this threshold.
+_STEP_TEXT_POSITIONS_MIN_CONTEXT = int(
+    os.environ.get("OMLX_QWEN4_STEP_TEXT_POSITIONS_MIN_CONTEXT", "32768")
+)
 
 
 class VLMModelAdapter(nn.Module):
@@ -75,6 +94,16 @@ class VLMModelAdapter(nn.Module):
         # the qualified gathered-QSA path. Generic/media/batched binds reset
         # the proof and retain the ordinary rank-three fail-closed path.
         self._qwen4_text_prefill_positions = False
+        # UIDs whose prefill the scheduler proved text-only (no media
+        # embeddings, scalar cache). A batch-one decode or MTP verify step for
+        # such a request may reuse the rank-two position proof above, which is
+        # what keeps Qwen4's gathered-QSA arms engaged after prefill.
+        self._uid_text_positions: set = set()
+        # Step-scoped proof (see set_step_rope_deltas): unlike the one-shot
+        # prefill proof it covers every adapter call of the bound step -- an
+        # MTP step runs a decode forward and then the verify forward -- and is
+        # cleared by the next bind.
+        self._qwen4_step_text_positions = False
 
     def release_resources(self) -> None:
         """Drop references to VLM-owned MLX arrays before engine teardown reclaim."""
@@ -84,8 +113,10 @@ class VLMModelAdapter(nn.Module):
         self._pending_embeds = None
         self._pending_kwargs = {}
         self._uid_rope_deltas.clear()
+        self._uid_text_positions.clear()
         self._batch_rope_deltas = None
         self._qwen4_text_prefill_positions = False
+        self._qwen4_step_text_positions = False
         self._language_model = None
         self._vlm_model = None
 
@@ -263,6 +294,7 @@ class VLMModelAdapter(nn.Module):
         self._language_model._rope_deltas = None
         self._batch_rope_deltas = None
         self._qwen4_text_prefill_positions = False
+        self._qwen4_step_text_positions = False
 
     def register_rope_delta(self, uid: int, delta: float) -> None:
         """Register rope_delta for a UID after VLM prefill."""
@@ -271,6 +303,29 @@ class VLMModelAdapter(nn.Module):
     def unregister_rope_delta(self, uid: int) -> None:
         """Remove rope_delta for a finished/aborted UID."""
         self._uid_rope_deltas.pop(uid, None)
+        self._uid_text_positions.discard(uid)
+
+    def mark_text_positions(self, uid: int) -> None:
+        """Record the scheduler's text-only proof for ``uid`` (see set_step_rope_deltas)."""
+        self._uid_text_positions.add(uid)
+
+    def set_step_rope_deltas(self, deltas: mx.array, uids) -> None:
+        """Bind rope deltas for one decode/verify step of the rows in ``uids``.
+
+        Like ``set_batch_rope_deltas`` but, for a batch-one step of a request
+        whose prefill was proven text-only, re-arms the one-shot rank-two
+        position proof so Qwen4's gathered-QSA decode and verify arms stay
+        eligible. Batched steps and unproven requests keep the generic
+        rank-three fail-closed form.
+        """
+        self._batch_rope_deltas = deltas
+        uids = list(uids) if uids is not None else []
+        self._qwen4_text_prefill_positions = False
+        self._qwen4_step_text_positions = bool(
+            not _STEP_TEXT_POSITIONS_DISABLED
+            and len(uids) == 1
+            and uids[0] in self._uid_text_positions
+        )
 
     def set_batch_rope_deltas(self, deltas: mx.array) -> None:
         """Set per-request rope_deltas for the current decode batch.
@@ -280,6 +335,7 @@ class VLMModelAdapter(nn.Module):
         """
         self._batch_rope_deltas = deltas
         self._qwen4_text_prefill_positions = False
+        self._qwen4_step_text_positions = False
 
     def set_text_prefill_rope_delta(self, delta: float) -> None:
         """Bind one scheduler-proven text row for an imminent prefill call.
@@ -291,6 +347,7 @@ class VLMModelAdapter(nn.Module):
 
         self._batch_rope_deltas = mx.array([delta])
         self._qwen4_text_prefill_positions = True
+        self._qwen4_step_text_positions = False
 
     def _batch_rope_deltas_for_size(self, batch_size: int) -> Optional[mx.array]:
         """Return rope deltas aligned to the current model input batch size."""
@@ -409,7 +466,8 @@ class VLMModelAdapter(nn.Module):
         # call therefore cannot leave a text-only capability armed for a later
         # media or generic request. Each external prefill chunk explicitly
         # re-arms it at its own model-call boundary.
-        qwen4_text_prefill_positions = self._qwen4_text_prefill_positions
+        prefill_text_positions = self._qwen4_text_prefill_positions
+        step_text_positions = self._qwen4_step_text_positions
         self._qwen4_text_prefill_positions = False
         return_hidden = bool(kwargs.get("return_hidden", False))
         if skip_lm_head:
@@ -441,6 +499,13 @@ class VLMModelAdapter(nn.Module):
                         break
                 batch_size, seq_len = input_ids.shape
                 deltas = self._batch_rope_deltas_for_size(batch_size)
+                # The step proof engages only above the context threshold; a
+                # scalar offset is the batch-one case the proof is bound to.
+                qwen4_text_prefill_positions = prefill_text_positions or (
+                    step_text_positions
+                    and isinstance(offsets, (int, float))
+                    and offsets >= _STEP_TEXT_POSITIONS_MIN_CONTEXT
+                )
                 base_offsets = None
                 if isinstance(offsets, mx.array):
                     if offsets.ndim == 0:
@@ -479,7 +544,7 @@ class VLMModelAdapter(nn.Module):
                         offsets,
                         batch_size,
                         seq_len,
-                        qwen4_text_prefill_positions=(qwen4_text_prefill_positions),
+                        qwen4_text_prefill_positions=prefill_text_positions,
                     )
                     result = self._language_model(
                         input_ids, cache=cache, position_ids=position_ids, **kwargs

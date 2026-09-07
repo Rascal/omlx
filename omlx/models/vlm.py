@@ -37,13 +37,14 @@ _STEP_TEXT_POSITIONS_DISABLED = os.environ.get(
     "OMLX_QWEN4_STEP_TEXT_POSITIONS", "1"
 ).strip().lower() in {"0", "false", "no", "off"}
 # Below this many cached tokens the backbone's decode/verify rows keep the generic
-# form. With the row gather on the cache's own layout the gathered-QSA arms
-# measured -1.6% serial at 5k (noise) and +6% at 41k, +13% at 82k, +35% at 206k
-# on an M5 Max (adaptive MTP with sampling: +2..+3% at 5k/41k, +12% at 82k,
-# +23% at 206k), so the crossover sits around 20-30k. The scheduler-proven
-# prefill positions are not subject to this threshold.
+# form. Measured on an M5 Max with the row gather on the cache's own layout,
+# arms on vs off at fixed context: 4k -2.0% serial / -5.2% adaptive MTP with
+# sampling, 8k -0.3% / -2.5%, 16k +0.3% / +0.7%, 31k +2.3% / +3.6%, then
+# +6..+35% serial and +12..+23% adaptive at 41k..206k. The crossover is near
+# 12k; 16k keeps short contexts on the dense path and collects the rest. The
+# scheduler-proven prefill positions are not subject to this threshold.
 _STEP_TEXT_POSITIONS_MIN_CONTEXT = int(
-    os.environ.get("OMLX_QWEN4_STEP_TEXT_POSITIONS_MIN_CONTEXT", "32768")
+    os.environ.get("OMLX_QWEN4_STEP_TEXT_POSITIONS_MIN_CONTEXT", "16384")
 )
 
 

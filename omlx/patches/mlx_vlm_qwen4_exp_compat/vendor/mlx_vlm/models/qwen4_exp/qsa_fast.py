@@ -35,16 +35,28 @@ def contiguous_causal_query_chunk(key_tokens: int) -> int:
     return 128
 
 
-def _batch_gather_tokens(values: mx.array, indices: mx.array) -> mx.array:
-    """Gather token rows independently for every batch without a host read."""
+def _gather_kv_rows(kv: mx.array, indices: mx.array) -> mx.array:
+    """Gather token rows of a stored ``(B, H, N, D)`` cache.
 
-    batch, tokens = values.shape[:2]
-    trailing = values.shape[2:]
-    offset_shape = (batch,) + (1,) * (indices.ndim - 1)
-    offsets = mx.arange(batch, dtype=mx.int32).reshape(offset_shape) * tokens
-    flat_indices = (indices.astype(mx.int32) + offsets).reshape(-1)
-    flat_values = values.reshape(batch * tokens, *trailing)
-    return flat_values[flat_indices].reshape(*indices.shape, *trailing)
+    ``indices`` is ``(B, S)`` -> ``(B, H, S, D)`` or ``(B, T, S)`` (one row set
+    per query) -> ``(B, T, H, S, D)``. The gather runs along the token axis of
+    the cache's own layout: transposing the cache to token-major and reshaping
+    it (the previous helper) copied the entire cache every call, a cost that
+    grew with the context and made the gathered arms slower than dense
+    attention (1.8 ms vs 0.7 ms per layer at 206k tokens on an M5 Max); this
+    form is flat in the context (~0.3 ms).
+    """
+
+    batch, heads, _, dim = kv.shape
+    flat = indices.astype(mx.int32).reshape(batch, -1)
+    if batch == 1:
+        rows = mx.take(kv, flat[0], axis=2)
+    else:
+        rows = mx.stack([mx.take(kv[b], flat[b], axis=1) for b in range(batch)])
+    if indices.ndim == 2:
+        return rows
+    per_query, width = indices.shape[1], indices.shape[2]
+    return rows.reshape(batch, heads, per_query, width, dim).transpose(0, 2, 1, 3, 4)
 
 
 def _portable_indexer_scores(
@@ -408,14 +420,8 @@ def contiguous_causal_gathered_qsa_decode(
         tail = mx.arange(complete_key_len, key_tokens, dtype=mx.int32)[None]
         selected_tokens = mx.concatenate((selected_tokens, tail), axis=-1)
 
-    key_rows = keys.transpose(0, 2, 1, 3)
-    value_rows = values.transpose(0, 2, 1, 3)
-    selected_keys = mx.contiguous(
-        _batch_gather_tokens(key_rows, selected_tokens).transpose(0, 2, 1, 3)
-    )
-    selected_values = mx.contiguous(
-        _batch_gather_tokens(value_rows, selected_tokens).transpose(0, 2, 1, 3)
-    )
+    selected_keys = _gather_kv_rows(keys, selected_tokens)
+    selected_values = _gather_kv_rows(values, selected_tokens)
     output = _decode_qsa_sdpa(
         queries,
         selected_keys,
@@ -517,8 +523,6 @@ def contiguous_causal_gathered_qsa(
     max_blocks = key_tokens // ratio
     block_budget = token_budget // ratio
     query_start = key_tokens - query_tokens
-    key_rows = keys.transpose(0, 2, 1, 3)
-    value_rows = values.transpose(0, 2, 1, 3)
 
     # A contiguous prompt shares the same block bank for every query.  The
     # caller can provide its cache of completed blocks; standalone users still
@@ -649,12 +653,8 @@ def contiguous_causal_gathered_qsa(
 
         safe_selected = mx.where(selected_valid, selected_indices, 0).astype(mx.int32)
 
-        selected_keys = _batch_gather_tokens(key_rows, safe_selected).transpose(
-            0, 1, 3, 2, 4
-        )
-        selected_values = _batch_gather_tokens(value_rows, safe_selected).transpose(
-            0, 1, 3, 2, 4
-        )
+        selected_keys = _gather_kv_rows(keys, safe_selected)
+        selected_values = _gather_kv_rows(values, safe_selected)
 
         chunk_queries = queries[:, :, start:stop].transpose(0, 2, 1, 3)
         grouped_queries = chunk_queries.reshape(

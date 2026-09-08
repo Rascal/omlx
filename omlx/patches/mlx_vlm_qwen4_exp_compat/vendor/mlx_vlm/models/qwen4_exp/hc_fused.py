@@ -26,6 +26,8 @@ logger = logging.getLogger(__name__)
 MAX_ROWS = 16
 _GROUP_SIZE = 64
 _SUPPORTED_BITS = (4, 5, 6, 8)
+# Uniform dtype, not bf16: fused_forward passes one ``T`` to all three kernels.
+_FUSED_DTYPES = (mx.bfloat16, mx.float16)
 _DISABLED = os.environ.get("OMLX_QWEN4_HC_FUSED", "1").strip().lower() in {
     "0",
     "false",
@@ -36,6 +38,7 @@ _KERNELS: dict[str, object] = {}
 _VALIDATED: set[tuple] = set()
 _RUNTIME_FAILED = False
 _FAILURE_LOGGED = False
+_ENGAGED_LOGGED = False
 _INELIGIBLE_LOGGED = False
 
 _N_SOURCE = r"""
@@ -248,7 +251,7 @@ def enabled() -> bool:
     return not _DISABLED and not _RUNTIME_FAILED
 
 
-def _quantized_ok(projection) -> bool:
+def _quantized_ok(projection, dtype) -> bool:
     return (
         type(projection) is nn.QuantizedLinear
         and getattr(projection, "group_size", None) == _GROUP_SIZE
@@ -259,8 +262,8 @@ def _quantized_ok(projection) -> bool:
         and projection.weight.dtype == mx.uint32
         and isinstance(getattr(projection, "scales", None), mx.array)
         and isinstance(getattr(projection, "biases", None), mx.array)
-        and projection.scales.dtype == mx.bfloat16
-        and projection.biases.dtype == mx.bfloat16
+        and projection.scales.dtype == dtype
+        and projection.biases.dtype == dtype
     )
 
 
@@ -284,10 +287,11 @@ def compatible(module, hyper_input) -> bool:
     if not (
         isinstance(hyper_input, mx.array)
         and hyper_input.ndim == 3
-        and hyper_input.dtype == mx.bfloat16
+        and hyper_input.dtype in _FUSED_DTYPES
         and 1 <= hyper_input.shape[0] * hyper_input.shape[1] <= MAX_ROWS
     ):
         return False
+    dtype = hyper_input.dtype
     if hasattr(module, "input_inject_weight"):
         return _ineligible("combined input projection layout")
     hc_count = getattr(module, "hc_count", None)
@@ -311,22 +315,39 @@ def compatible(module, hyper_input) -> bool:
         norm is not None
         and getattr(norm, "group_size", None) == hidden
         and isinstance(getattr(norm, "weight", None), mx.array)
-        and norm.weight.dtype == mx.bfloat16
+        and norm.weight.dtype == dtype
         and norm.weight.shape == (hc_count * hidden,)
     ):
         return _ineligible("hc_norm layout")
     if not (
-        _quantized_ok(getattr(module, "input_mix_weight_down", None))
-        and _quantized_ok(getattr(module, "input_mix_weight_up", None))
+        _quantized_ok(getattr(module, "input_mix_weight_down", None), dtype)
+        and _quantized_ok(getattr(module, "input_mix_weight_up", None), dtype)
     ):
         return _ineligible(
-            "projection quantisation (need affine group-size-64 4/5/6/8-bit with bf16 scales)"
+            "projection quantisation (need affine group-size-64 4/5/6/8-bit with "
+            f"uint32 payloads and {dtype} scales/biases)"
         )
     if "block_inject_weight" in module and not _quantized_ok(
-        module.block_inject_weight
+        module.block_inject_weight, dtype
     ):
         return _ineligible("block_inject_weight quantisation")
-    return mx.default_device() == mx.gpu and mx.metal.is_available()
+    if not (mx.default_device() == mx.gpu and mx.metal.is_available()):
+        return False
+    # Once per process: compatible() runs per module per decode step.
+    global _ENGAGED_LOGGED
+    if not _ENGAGED_LOGGED:
+        _ENGAGED_LOGGED = True
+        logger.info(
+            "Qwen4 fused hyper-connection kernels engaged: dtype=%s rows=%d hidden=%d "
+            "hc_lowrank=%d hc_count=%d",
+            # "mlx.core.float16" -> "float16"; this MLX build has no Dtype.name.
+            str(dtype).rsplit(".", 1)[-1],
+            int(hyper_input.shape[0] * hyper_input.shape[1]),
+            hidden,
+            lowrank,
+            hc_count,
+        )
+    return True
 
 
 def _eps_array(module) -> mx.array:

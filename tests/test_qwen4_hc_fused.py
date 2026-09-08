@@ -22,7 +22,7 @@ HC, HIDDEN, LOWRANK = 4, 2560, 320
 WIDTH = HC * HIDDEN
 
 
-def _module(bits: int, use_combine: bool = True, hidden: int = HIDDEN):
+def _module(bits: int, use_combine: bool = True, hidden: int = HIDDEN, dtype=mx.bfloat16):
     compat.apply_mlx_vlm_qwen4_exp_compat_patch()
     from mlx_vlm.models.qwen4_exp.language import Qwen4ExpGatedResidual, Qwen4ExpRMSNorm
 
@@ -31,7 +31,7 @@ def _module(bits: int, use_combine: bool = True, hidden: int = HIDDEN):
     nn.Module.__init__(module)
     module.hc_count, module.hidden_size, module.hc_lowrank = HC, hidden, LOWRANK
     module.hc_norm = Qwen4ExpRMSNorm(width, group_size=hidden, eps=1e-6)
-    module.hc_norm.weight = (mx.random.normal((width,)) * 0.05).astype(mx.bfloat16)
+    module.hc_norm.weight = (mx.random.normal((width,)) * 0.05).astype(dtype)
     module.input_mix_weight_down = nn.QuantizedLinear(
         width, LOWRANK, bias=False, group_size=64, bits=bits
     )
@@ -49,10 +49,10 @@ def _module(bits: int, use_combine: bool = True, hidden: int = HIDDEN):
             # up-projection gate into saturation where any rounding difference flips whole elements.
             projection.scales = (
                 mx.abs(mx.random.normal(projection.scales.shape)) * 0.01 + 0.002
-            ).astype(mx.bfloat16)
+            ).astype(dtype)
             projection.biases = (
                 mx.random.normal(projection.biases.shape) * 0.005
-            ).astype(mx.bfloat16)
+            ).astype(dtype)
     mx.eval(module.parameters())
     return module
 
@@ -77,10 +77,12 @@ def _reference_fp32(module, x):
     return mixed, 2 * mx.sigmoid((normed @ dequant(module.block_inject_weight).T) / HC)
 
 
-def _ulps(a, b):
+def _ulps(a, b, mantissa_bits: int = 7):
+    # fp16 has a 10-bit mantissa, not bf16's 7; reusing 7 inflates the divisor 8x and
+    # every parity assertion passes vacuously.
     a = a.astype(mx.float32)
     b = b.astype(mx.float32)
-    ulp = float(mx.abs(b).max().item()) * 2.0**-7
+    ulp = float(mx.abs(b).max().item()) * 2.0**-mantissa_bits
     diff = mx.abs(a - b) / ulp
     return float(diff.max().item()), float(diff.mean().item())
 
@@ -107,11 +109,12 @@ def test_fused_matches_canonical_path_at_other_hidden_sizes(hidden, bits):
     _assert_fused_matches_canonical(_module(bits, True, hidden=hidden), 16, True)
 
 
-def _assert_fused_matches_canonical(module, rows, use_combine):
+def _assert_fused_matches_canonical(module, rows, use_combine, dtype=mx.bfloat16):
     from mlx_vlm.models.qwen4_exp import hc_fused
 
+    mantissa_bits = 10 if dtype == mx.float16 else 7
     hidden = module.hidden_size
-    x = mx.random.normal((1, rows, HC * hidden)).astype(mx.bfloat16)
+    x = mx.random.normal((1, rows, HC * hidden)).astype(dtype)
     mx.eval(x)
     assert hc_fused.compatible(module, x)
     fused = hc_fused.fused_forward(module, x)
@@ -124,18 +127,18 @@ def _assert_fused_matches_canonical(module, rows, use_combine):
         canon_mixed, _, canon_inject = canonical
         assert passthrough is x
         assert fused_inject.shape == canon_inject.shape == (1, rows, HC)
-        assert _ulps(fused_inject, canon_inject)[0] <= 4
-        assert _ulps(fused_inject, ref_inject)[0] <= 4
+        assert _ulps(fused_inject, canon_inject, mantissa_bits)[0] <= 4
+        assert _ulps(fused_inject, ref_inject, mantissa_bits)[0] <= 4
     else:
         fused_mixed, canon_mixed = fused, canonical
     assert fused_mixed.shape == canon_mixed.shape == (1, rows, hidden)
-    assert fused_mixed.dtype == mx.bfloat16
-    max_vs_canon, mean_vs_canon = _ulps(fused_mixed, canon_mixed)
+    assert fused_mixed.dtype == dtype
+    max_vs_canon, mean_vs_canon = _ulps(fused_mixed, canon_mixed, mantissa_bits)
     assert max_vs_canon <= 16 and mean_vs_canon <= 0.5
     # Both paths round differently; judge each against fp32. The fused path keeps fp32 through
     # the epilogues, so it must stay at least as close to fp32 as the canonical path (with slack).
-    max_fused, mean_fused = _ulps(fused_mixed, ref_mixed)
-    max_canon, mean_canon = _ulps(canon_mixed, ref_mixed)
+    max_fused, mean_fused = _ulps(fused_mixed, ref_mixed, mantissa_bits)
+    max_canon, mean_canon = _ulps(canon_mixed, ref_mixed, mantissa_bits)
     assert max_fused <= max(2 * max_canon, 6)
     assert mean_fused <= mean_canon * 1.5 + 0.05
 
@@ -217,6 +220,52 @@ def test_ineligible_model_is_logged_once(monkeypatch, caplog):
 
 
 @pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
+def test_engagement_is_logged_once(monkeypatch, caplog):
+    """Engagement must be assertable from the log, not inferred from the absence of refusals."""
+    from mlx_vlm.models.qwen4_exp import hc_fused
+
+    def engaged():
+        return [
+            r.getMessage()
+            for r in caplog.records
+            if "fused hyper-connection kernels engaged" in r.getMessage()
+        ]
+
+    monkeypatch.setattr(hc_fused, "_ENGAGED_LOGGED", False)
+    module = _module(4)
+    fp16_module = _module(4, dtype=mx.float16)
+    with caplog.at_level("INFO", logger=hc_fused.logger.name):
+        assert hc_fused.compatible(module, mx.random.normal((1, 4, WIDTH)).astype(mx.bfloat16))
+        assert hc_fused.compatible(module, mx.random.normal((1, 4, WIDTH)).astype(mx.bfloat16))
+        assert hc_fused.compatible(fp16_module, mx.random.normal((1, 4, WIDTH)).astype(mx.float16))
+    messages = engaged()
+    assert len(messages) == 1
+    assert "dtype=bfloat16" in messages[0]
+
+    monkeypatch.setattr(hc_fused, "_ENGAGED_LOGGED", False)
+    caplog.clear()
+    with caplog.at_level("INFO", logger=hc_fused.logger.name):
+        assert hc_fused.compatible(fp16_module, mx.random.normal((1, 4, WIDTH)).astype(mx.float16))
+    messages = engaged()
+    assert len(messages) == 1
+    assert "dtype=float16" in messages[0]
+
+    # A silent dtype/rows skip must never be mistaken for engagement.
+    monkeypatch.setattr(hc_fused, "_ENGAGED_LOGGED", False)
+    caplog.clear()
+    with caplog.at_level("INFO", logger=hc_fused.logger.name):
+        assert not hc_fused.compatible(module, mx.random.normal((1, 64, WIDTH)).astype(mx.bfloat16))
+    assert engaged() == []
+
+    # Refusal and engagement are mutually exclusive for the same module.
+    monkeypatch.setattr(hc_fused, "_ENGAGED_LOGGED", False)
+    caplog.clear()
+    with caplog.at_level("INFO", logger=hc_fused.logger.name):
+        assert not hc_fused.compatible(_module(4, True, hidden=800), mx.random.normal((1, 4, HC * 800)).astype(mx.bfloat16))
+    assert engaged() == []
+
+
+@pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
 def test_fused_path_takes_precedence_over_exact_hybrid_projection(monkeypatch):
     # Fused dispatch takes precedence over the compiled hybrid decode path.
     from mlx_vlm.models.qwen4_exp import hc_fused
@@ -251,8 +300,12 @@ def test_compatible_fails_closed():
     assert not hc_fused.compatible(
         module, mx.random.normal((2, 9, WIDTH)).astype(mx.bfloat16)
     )
+    # fp16 is admissible only when the whole set shares it; this module is bf16.
     assert not hc_fused.compatible(
         module, mx.random.normal((1, 4, WIDTH)).astype(mx.float16)
+    )
+    assert not hc_fused.compatible(
+        module, mx.random.normal((1, 4, WIDTH)).astype(mx.float32)
     )
     assert not hc_fused.compatible(
         module, mx.random.normal((4, WIDTH)).astype(mx.bfloat16)
@@ -262,6 +315,32 @@ def test_compatible_fails_closed():
     del module.input_inject_weight
     module.input_mix_weight_down = nn.Linear(WIDTH, LOWRANK, bias=False)
     assert not hc_fused.compatible(module, ok)
+
+
+@pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
+def test_uniform_fp16_module_takes_the_fused_path():
+    """No hardware bf16 on M1/M2, so an fp16 quantization must reach the fused kernels."""
+    from mlx_vlm.models.qwen4_exp import hc_fused
+
+    module = _module(4, dtype=mx.float16)
+    x = mx.random.normal((1, 4, WIDTH)).astype(mx.float16)
+    assert hc_fused.compatible(module, x)
+    # A single dtype straggler must be refused: it would be read as the wrong type.
+    for attr in ("hc_norm", "input_mix_weight_up"):
+        target = module.hc_norm.weight if attr == "hc_norm" else module.input_mix_weight_up.scales
+        before = target
+        target = target.astype(mx.bfloat16)
+        if attr == "hc_norm":
+            module.hc_norm.weight = target
+        else:
+            module.input_mix_weight_up.scales = target
+        assert not hc_fused.compatible(module, x), attr
+        if attr == "hc_norm":
+            module.hc_norm.weight = before
+        else:
+            module.input_mix_weight_up.scales = before
+    mx.random.seed(20260907)
+    _assert_fused_matches_canonical(_module(4, dtype=mx.float16), 4, True, mx.float16)
 
 
 def test_kill_switch_disables_fused_path(monkeypatch):

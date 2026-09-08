@@ -35,9 +35,22 @@ def contiguous_causal_query_chunk(key_tokens: int) -> int:
     return 128
 
 
+_TOKEN_MAJOR_MIN_QUERIES = 32
+_TOKEN_MAJOR_MAX_TOKENS = 131072
+
+
 def _gather_kv_rows(kv: mx.array, indices: mx.array) -> mx.array:
-    """Gather token rows along the stored ``(B, H, N, D)`` cache's token axis without
-    copying it: ``(B, S)`` -> ``(B, H, S, D)``, ``(B, T, S)`` -> ``(B, T, H, S, D)``."""
+    """Gather token rows of the stored ``(B, H, N, D)`` cache: ``(B, S)`` -> ``(B, H, S, D)``,
+    ``(B, T, S)`` -> ``(B, T, H, S, D)``. Prefill-width gathers copy token-major below 128k."""
+
+    per_query = indices.shape[1] if indices.ndim == 3 else 1
+    if per_query >= _TOKEN_MAJOR_MIN_QUERIES and kv.shape[2] < _TOKEN_MAJOR_MAX_TOKENS:
+        return _gather_kv_rows_token_major(kv, indices)
+    return _gather_kv_rows_stored(kv, indices)
+
+
+def _gather_kv_rows_stored(kv: mx.array, indices: mx.array) -> mx.array:
+    """Take along the stored token axis: cheapest for few queries, no copy of the cache."""
 
     batch, heads, _, dim = kv.shape
     flat = indices.astype(mx.int32).reshape(batch, -1)
@@ -49,6 +62,19 @@ def _gather_kv_rows(kv: mx.array, indices: mx.array) -> mx.array:
         return rows
     per_query, width = indices.shape[1], indices.shape[2]
     return rows.reshape(batch, heads, per_query, width, dim).transpose(0, 2, 1, 3, 4)
+
+
+def _gather_kv_rows_token_major(kv: mx.array, indices: mx.array) -> mx.array:
+    """Copy the cache token-major and gather flat rows: cheaper for many queries per token."""
+
+    batch, heads, tokens, dim = kv.shape
+    rows = kv.transpose(0, 2, 1, 3).reshape(batch * tokens, heads, dim)
+    flat = indices.astype(mx.int32).reshape(batch, -1)
+    if batch > 1:
+        flat = flat + (mx.arange(batch, dtype=mx.int32) * tokens)[:, None]
+    gathered = rows[flat.reshape(-1)].reshape(*indices.shape, heads, dim)
+    axes = (0, 2, 1, 3) if indices.ndim == 2 else (0, 1, 3, 2, 4)
+    return gathered.transpose(*axes)
 
 
 def _portable_indexer_scores(

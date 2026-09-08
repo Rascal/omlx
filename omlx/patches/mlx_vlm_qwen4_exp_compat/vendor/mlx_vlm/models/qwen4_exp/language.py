@@ -1593,6 +1593,10 @@ class Qwen4ExpGatedResidual(nn.Module):
             fused = hc_fused.fused_forward(self, hyper_input)
             if fused is not None:
                 return fused
+        if not target_verify and hc_fused.prefill_compatible(self, hyper_input):
+            fused = hc_fused.prefill_forward(self, hyper_input)
+            if fused is not None:
+                return fused
         compiled_forward = getattr(self, "_compiled_forward", None)
         if (
             compiled_forward is not None

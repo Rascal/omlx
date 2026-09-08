@@ -351,3 +351,62 @@ def test_native_topk_min_rows_env_override(monkeypatch, fake_native_topk):
     qsa_fast._native_topk_min_rows.cache_clear()
     assert _topk_rows(1) is not None
     assert fake_native_topk == [(1, 1, 4096)]
+
+
+@pytest.fixture
+def fake_native_sparse_attention(monkeypatch):
+    seen = []
+
+    def attention(queries, keys, values, blocks, scale, q_offset, **kwargs):
+        seen.append(queries.shape)
+        return mx.zeros((1, queries.shape[2], 24, 256), dtype=queries.dtype)
+
+    monkeypatch.setattr(fast, "is_native_available", lambda: True)
+    monkeypatch.setattr(fast, "has_symbol", lambda name: True)
+    monkeypatch.setattr(fast, "qwen4_qsa_sparse_gqa_attention", attention)
+    monkeypatch.setattr(qsa_fast, "_NATIVE_QSA_MAIN_DISABLED", False)
+    monkeypatch.setattr(qsa_fast, "_NATIVE_QSA_MAIN_PROVEN", True)
+    monkeypatch.delenv("OMLX_QWEN4_QSA_NATIVE_MAIN_MIN_ROWS", raising=False)
+    qsa_fast._native_main_min_rows.cache_clear()
+    yield seen
+    qsa_fast._native_main_min_rows.cache_clear()
+
+
+def _attention_rows(rows):
+    kv = mx.zeros((1, 2, 4096, 256), dtype=mx.bfloat16)
+    return qsa_fast._native_sparse_gqa_attention(
+        mx.zeros((1, 24, rows, 256), dtype=mx.bfloat16),
+        kv,
+        kv,
+        mx.zeros((1, rows, 512), dtype=mx.int32),
+        q_offset=0,
+    )
+
+
+@pytest.mark.parametrize("rows", [4, 8, 16])
+def test_native_sparse_attention_yields_to_gathered_sdpa_for_verify_rows_on_nax(monkeypatch, fake_native_sparse_attention, rows):
+    monkeypatch.setattr(qsa_fast, "_nax_gpu", lambda: True)
+    assert _attention_rows(rows) is None
+    assert fake_native_sparse_attention == []
+    assert qsa_fast._NATIVE_QSA_MAIN_DISABLED is False
+
+
+@pytest.mark.parametrize("rows", [24, 64, 2048])
+def test_native_sparse_attention_keeps_native_for_prefill_rows_on_nax(monkeypatch, fake_native_sparse_attention, rows):
+    monkeypatch.setattr(qsa_fast, "_nax_gpu", lambda: True)
+    assert _attention_rows(rows) is not None
+    assert fake_native_sparse_attention == [(1, 24, rows, 256)]
+
+
+def test_native_sparse_attention_stays_native_for_verify_rows_off_nax(monkeypatch, fake_native_sparse_attention):
+    monkeypatch.setattr(qsa_fast, "_nax_gpu", lambda: False)
+    assert _attention_rows(4) is not None
+    assert fake_native_sparse_attention == [(1, 24, 4, 256)]
+
+
+def test_native_sparse_attention_min_rows_env_override(monkeypatch, fake_native_sparse_attention):
+    monkeypatch.setattr(qsa_fast, "_nax_gpu", lambda: True)
+    monkeypatch.setenv("OMLX_QWEN4_QSA_NATIVE_MAIN_MIN_ROWS", "0")
+    qsa_fast._native_main_min_rows.cache_clear()
+    assert _attention_rows(4) is not None
+    assert fake_native_sparse_attention == [(1, 24, 4, 256)]

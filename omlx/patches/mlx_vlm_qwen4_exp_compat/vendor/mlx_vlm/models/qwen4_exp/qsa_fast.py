@@ -60,6 +60,13 @@ def _native_topk_min_rows() -> int:
     return _min_rows("OMLX_QWEN4_QSA_NATIVE_TOPK_MIN_ROWS", 8)
 
 
+@functools.lru_cache(maxsize=None)
+def _native_main_min_rows() -> int:
+    """Query rows from which the native sparse GQA kernel engages; the gathered SDPA
+    is faster below it on NAX GPUs (0.7 vs 1.6 ms per layer at verify width)."""
+    return _min_rows("OMLX_QWEN4_QSA_NATIVE_MAIN_MIN_ROWS", 24)
+
+
 def contiguous_causal_query_chunk(key_tokens: int) -> int:
     """Keep long-context score sheets bounded without tiny launch overhead."""
 
@@ -309,6 +316,8 @@ def _native_sparse_gqa_attention(
         or q_offset < 0
         or q_offset + queries.shape[2] > keys.shape[2]
     ):
+        return None
+    if queries.shape[2] < _native_main_min_rows():
         return None
     try:
         from omlx.custom_kernels.glm_moe_dsa import fast

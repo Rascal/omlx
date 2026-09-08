@@ -8,7 +8,9 @@ multimodal, and target-verify requests use mlx-vlm's general implementation.
 
 from __future__ import annotations
 
+import functools
 import math
+import os
 from collections.abc import Callable
 
 import mlx.core as mx
@@ -23,6 +25,28 @@ _NATIVE_QSA_TOPK_DISABLED = False
 _NATIVE_QSA_TOPK_PROVEN = False
 _NATIVE_QSA_MAIN_DISABLED = False
 _NATIVE_QSA_MAIN_PROVEN = False
+
+
+def _nax_gpu() -> bool:
+    try:
+        from omlx.custom_kernels.nax import is_nax_available
+
+        return bool(is_nax_available())
+    except Exception:
+        return False
+
+
+@functools.lru_cache(maxsize=None)
+def _native_score_min_rows() -> int:
+    """Query rows from which the native indexer-score kernel engages; below it the
+    MLX ops are faster on NAX GPUs (0.27 vs 0.36-0.77 ms per layer at 1-16 rows)."""
+    raw = os.environ.get("OMLX_QWEN4_QSA_NATIVE_SCORE_MIN_ROWS", "").strip()
+    if raw:
+        try:
+            return max(0, int(raw))
+        except ValueError:
+            pass
+    return 32 if _nax_gpu() else 0
 
 
 def contiguous_causal_query_chunk(key_tokens: int) -> int:
@@ -172,6 +196,8 @@ def _native_indexer_scores(
         or compress_ratio != 4
         or mask_q_offset < 0
     ):
+        return None
+    if queries.shape[1] < _native_score_min_rows():
         return None
 
     try:

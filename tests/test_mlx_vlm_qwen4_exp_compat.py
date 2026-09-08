@@ -1718,3 +1718,114 @@ def test_disk_backed_ple_rejects_out_of_range_indices(tmp_path):
     with pytest.raises(IndexError):
         embedding(mx.array([[1, 8]], dtype=mx.int32))
     embedding.close()
+
+
+def test_disk_backed_ple_prefetch_serves_the_matching_call(tmp_path):
+    """A prefetched chunk is assembled off the main thread and consumed by the next call with the same indices."""
+    embedding, table = _disk_ple(tmp_path, shards=3, rows=8, dims=64, bits=5)
+    first = mx.array([[3, 17, 5, 22, 3, 9]], dtype=mx.int32)
+    other = mx.array([[1, 2]], dtype=mx.int32)
+    embedding.prefetch(first)
+    # The prefill loops announce chunk k+1 before chunk k gathers: both must stay pending until consumed.
+    embedding.prefetch(other)
+    values = embedding(first)
+    mx.eval(values)
+    assert embedding.last_prefetch_hit is True
+    values_other = embedding(other)
+    mx.eval(values_other)
+    assert embedding.last_prefetch_hit is True
+    assert mx.array_equal(values_other, mx.take(table, other.reshape(-1), axis=0)[None]).item()
+    assert embedding(other) is not None and embedding.last_prefetch_hit is False
+    values = embedding(first)
+    mx.eval(values)
+    assert embedding.last_prefetch_hit is False
+    assert mx.array_equal(values, mx.take(table, first.reshape(-1), axis=0)[None]).item()
+    values = embedding(other)
+    mx.eval(values)
+    assert embedding.last_prefetch_hit is False
+    assert mx.array_equal(values, mx.take(table, other.reshape(-1), axis=0)[None]).item()
+    embedding.close()
+
+
+def test_prompt_loop_prefetches_the_next_chunk(monkeypatch):
+    """While a chunk runs, the model is told the next chunk and the chunk it follows."""
+    compat.apply_mlx_vlm_qwen4_exp_compat_patch()
+    from mlx_lm.generate import PromptProcessingBatch
+
+    seen, forwards = [], []
+
+    class Model:
+        def __call__(self, tokens, cache=None):
+            forwards.append(tokens.tolist()[0])
+
+        def prefetch_ple(self, next_ids, current_ids):
+            seen.append((next_ids.tolist()[0], current_ids.tolist()[0]))
+
+    batch = PromptProcessingBatch(Model(), uids=[0], caches=[[]], prefill_step_size=4)
+    batch.prompt([list(range(10, 20))])
+    assert forwards == [[10, 11, 12, 13], [14, 15, 16, 17], [18, 19]]
+    assert seen == [([14, 15, 16, 17], [10, 11, 12, 13]), ([18, 19], [14, 15, 16, 17])]
+
+
+def test_prompt_loop_without_a_prefetch_hook_is_unchanged():
+    compat.apply_mlx_vlm_qwen4_exp_compat_patch()
+    from mlx_lm.generate import PromptProcessingBatch
+
+    forwards = []
+
+    class Model:
+        def __call__(self, tokens, cache=None):
+            forwards.append(tokens.shape[1])
+
+    PromptProcessingBatch(Model(), uids=[0], caches=[[]], prefill_step_size=3).prompt([list(range(7))])
+    assert forwards == [3, 3, 1]
+
+
+def test_ngram_prefetch_computes_the_next_chunks_indices():
+    """prefetch(next, tail of current) hashes exactly the rows the next real call will gather."""
+    from mlx_vlm.models.qwen4_exp.language import Qwen4ExpNGramEmbedding
+
+    config = _tiny_config()
+    config = getattr(config, "text_config", config)
+    embedding = Qwen4ExpNGramEmbedding(config, config.ple_embed_dim, 1, 0)
+    inner = embedding.ngram_embedding
+    seen = {}
+
+    class Recorder:
+        def __call__(self, indices):
+            seen["call"] = indices
+            return inner(indices)
+
+        def prefetch(self, indices):
+            seen["prefetch"] = indices
+
+    embedding.ngram_embedding = Recorder()
+    cache = [None, None, None, None]
+    chunk1 = mx.array([[5, 9, 2, 7, 1, 4, 4, 8]], dtype=mx.int64)
+    chunk2 = mx.array([[3, 3, 6, 1, 9]], dtype=mx.int64)
+    mx.eval(embedding(chunk1, cache))
+    embedding.prefetch(chunk2, chunk1[:, -embedding.context_len :])
+    mx.eval(embedding(chunk2, cache))
+    assert seen["prefetch"].shape == seen["call"].shape
+    assert mx.array_equal(seen["prefetch"], seen["call"]).item()
+
+
+def test_prompt_lookahead_keeps_the_schedulers_mrope_hook(monkeypatch):
+    """The scheduler wraps prompt() to set mRoPE deltas first; the lookahead loop must run under it, not over it."""
+    import omlx.scheduler as scheduler  # installs the wrapper
+
+    compat.apply_mlx_vlm_qwen4_exp_compat_patch()
+    from mlx_lm.generate import PromptProcessingBatch
+
+    order = []
+    monkeypatch.setattr(scheduler, "_prepare_mrope_prompt", lambda self: order.append("before"))
+
+    class Model:
+        def __call__(self, tokens, cache=None):
+            order.append(("forward", tokens.shape[1]))
+
+        def prefetch_ple(self, next_ids, current_ids):
+            order.append(("prefetch", next_ids.shape[1]))
+
+    PromptProcessingBatch(Model(), uids=[0], caches=[[]], prefill_step_size=4).prompt([list(range(6))])
+    assert order == ["before", ("prefetch", 2), ("forward", 4), ("forward", 2)]

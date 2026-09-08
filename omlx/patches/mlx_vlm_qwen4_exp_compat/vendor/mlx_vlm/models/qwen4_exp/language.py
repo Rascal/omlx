@@ -1846,6 +1846,8 @@ def _find_nth_prime_after(start: int, count: int) -> int:
 # data path. Remembering pages avoids repeating thread-pool work on warm reads.
 # os.pread releases the GIL and does not change the shared file position.
 _PLE_IO_POOL = ThreadPoolExecutor(max_workers=48, thread_name_prefix="ple-io")
+# One worker: a chunk's rows are gathered while the previous chunk runs on the GPU.
+_PLE_PREFETCH_POOL = ThreadPoolExecutor(max_workers=1, thread_name_prefix="ple-prefetch")
 _PLE_PAGE_SIZE = os.sysconf("SC_PAGE_SIZE")
 # Slow gathers may indicate page eviction. Allow normal gather overhead and
 # rate-limit retries; elapsed time is a heuristic, not a residency check.
@@ -2015,6 +2017,8 @@ class DiskBackedShardedEmbedding(nn.Module):
         self._prefix = prefix
         self.rows_read = 0
         self.last_uploads = 0
+        self.last_prefetch_hit = False
+        self._pending: dict[bytes, tuple] = {}
         self.last_touched_shards: tuple[int, ...] = ()
         self._readers: dict[str, _SafeTensorMMap] = {}
         self._tensor_readers: dict[str, _SafeTensorMMap] = {}
@@ -2144,21 +2148,12 @@ class DiskBackedShardedEmbedding(nn.Module):
                 group_size,
             )
 
-    def __call__(self, indices: mx.array) -> mx.array:
-        shape = indices.shape
-        flat = indices.reshape(-1)
-        mx.eval(flat)
-        host = np.asarray(flat.astype(mx.int64)).reshape(-1)
-        if host.size == 0:
-            return mx.zeros((*shape, self.dims), dtype=mx.bfloat16)
-        if int(host.min()) < 0 or int(host.max()) >= self.shard_offsets[-1]:
-            raise IndexError("embedding index is outside the sharded vocabulary")
+    def _plan(self, host: np.ndarray):
+        """Shards, local rows and tensor families for a chunk; None when the touched shards differ."""
         offsets = np.asarray(self.shard_offsets, dtype=np.int64)
         shard = np.searchsorted(offsets, host, side="right") - 1
         local = host - offsets[shard]
         touched = [int(index) for index in np.unique(shard)]
-        self.last_touched_shards = tuple(touched)
-        self.rows_read = int(host.size)
         specs = [self._shard_specs[index] for index in touched]
         bits, group_size = specs[0][3], specs[0][4]
         families = [0] if bits is None else [0, 1, 2]
@@ -2171,9 +2166,12 @@ class DiskBackedShardedEmbedding(nn.Module):
             for spec in specs
             for family in families
         ):
-            return self._gather_per_shard([int(index) for index in host], shape)
-        # Assemble every family's rows on the host in index order: one upload and
-        # one dequantize per chunk instead of one per touched shard.
+            return None
+        return shard, local, touched, specs, families, dtypes, bits, group_size
+
+    def _assemble(self, host: np.ndarray, plan) -> dict[int, np.ndarray]:
+        """Copy every family's rows into one host buffer in index order (runs off the main thread on prefetch)."""
+        shard, local, touched, specs, families, _, _, _ = plan
         buffers: dict[int, np.ndarray] = {}
         for shard_index, spec in zip(touched, specs):
             positions = np.flatnonzero(shard == shard_index)
@@ -2186,6 +2184,50 @@ class DiskBackedShardedEmbedding(nn.Module):
                     buffer = np.empty((host.size, copied.shape[1]), dtype=copied.dtype)
                     buffers[family] = buffer
                 buffer[positions] = copied
+        return buffers
+
+    def _host_indices(self, indices: mx.array) -> np.ndarray:
+        flat = indices.reshape(-1)
+        mx.eval(flat)
+        host = np.asarray(flat.astype(mx.int64)).reshape(-1)
+        if host.size and (int(host.min()) < 0 or int(host.max()) >= self.shard_offsets[-1]):
+            raise IndexError("embedding index is outside the sharded vocabulary")
+        return host
+
+    def prefetch(self, indices: mx.array) -> None:
+        """Assemble a chunk's rows on the prefetch worker; a later call with the same indices consumes them."""
+        host = self._host_indices(indices)
+        if host.size == 0:
+            return
+        plan = self._plan(host)
+        if plan is None:
+            return
+        key = host.tobytes()
+        if key in self._pending:
+            return
+        # Two slots: the chunk after the one about to run is announced before that one gathers.
+        while len(self._pending) >= 2:
+            del self._pending[next(iter(self._pending))]
+        self._pending[key] = (plan, _PLE_PREFETCH_POOL.submit(self._assemble, host, plan))
+
+    def __call__(self, indices: mx.array) -> mx.array:
+        shape = indices.shape
+        host = self._host_indices(indices)
+        if host.size == 0:
+            return mx.zeros((*shape, self.dims), dtype=mx.bfloat16)
+        pending = self._pending.pop(host.tobytes(), None)
+        if pending is not None:
+            plan, buffers = pending[0], pending[1].result()
+            self.last_prefetch_hit = True
+        else:
+            self.last_prefetch_hit = False
+            plan = self._plan(host)
+            if plan is None:
+                return self._gather_per_shard([int(index) for index in host], shape)
+            buffers = self._assemble(host, plan)
+        _, _, touched, _, families, dtypes, bits, group_size = plan
+        self.last_touched_shards = tuple(touched)
+        self.rows_read = int(host.size)
         arrays = [_SafeTensorMMap.to_mx(buffers[family], dtypes[family]) for family in families]
         self.last_uploads = len(arrays)
         values = arrays[0]
@@ -2498,14 +2540,8 @@ class Qwen4ExpNGramEmbedding(nn.Module):
             (batch, self.context_len), self.eos_token_id, dtype=mx.int64
         )
 
-    def __call__(self, input_ids: mx.array, cache: Optional[ArraysCache]):
-        input_ids = input_ids.astype(mx.int64)
-        previous_context = self._previous_context(input_ids, cache)
-
-        token_history = mx.concatenate([previous_context, input_ids], axis=-1)
-        if cache is not None:
-            cache[3] = mx.contiguous(token_history[:, -self.context_len :])
-
+    def _ngram_indices(self, token_history: mx.array, length: int) -> mx.array:
+        """Hashed table rows for the last ``length`` tokens of ``token_history``."""
         shifted_tokens = [
             self._shift_right_ignore_eos(token_history, shift)
             for shift in range(self.ngram_size)
@@ -2525,7 +2561,26 @@ class Qwen4ExpNGramEmbedding(nn.Module):
             ngram_ids = mixed_ids[..., None] % sizes[None, None]
             blocks.append(ngram_ids + offsets[None, None])
 
-        ngram_ids = mx.concatenate(blocks, axis=-1)[:, -input_ids.shape[1] :]
+        return mx.concatenate(blocks, axis=-1)[:, -length:]
+
+    def prefetch(self, next_ids: mx.array, previous_context: mx.array) -> None:
+        """Gather the rows of an upcoming chunk ahead of time (SSD-backed tables only)."""
+        prefetch = getattr(self.ngram_embedding, "prefetch", None)
+        if prefetch is None:
+            return
+        next_ids = next_ids.astype(mx.int64)
+        history = mx.concatenate([previous_context.astype(mx.int64), next_ids], axis=-1)
+        prefetch(self._ngram_indices(history, next_ids.shape[1]))
+
+    def __call__(self, input_ids: mx.array, cache: Optional[ArraysCache]):
+        input_ids = input_ids.astype(mx.int64)
+        previous_context = self._previous_context(input_ids, cache)
+
+        token_history = mx.concatenate([previous_context, input_ids], axis=-1)
+        if cache is not None:
+            cache[3] = mx.contiguous(token_history[:, -self.context_len :])
+
+        ngram_ids = self._ngram_indices(token_history, input_ids.shape[1])
         embeddings = self.ngram_embedding(ngram_ids)
         return embeddings.reshape(*embeddings.shape[:-2], -1)
 
@@ -2931,6 +2986,26 @@ class LanguageModel(Qwen3_5LanguageModel):
         if mtp_capture and output.hidden_states:
             output.hidden_states = [output.hidden_states[0]]
         return output
+
+    def prefetch_ple(self, next_ids: mx.array, current_ids: mx.array) -> None:
+        """Start gathering the next prefill chunk's PLE rows while ``current_ids`` runs."""
+        for layer in self.model.layers:
+            ple = getattr(layer, "ple", None)
+            if ple is None:
+                continue
+            embedding = ple.ple_embedding
+            if getattr(embedding.ngram_embedding, "prefetch", None) is None:
+                continue
+            fill = mx.full(
+                (current_ids.shape[0], embedding.context_len),
+                embedding.eos_token_id,
+                dtype=mx.int64,
+            )
+            history = mx.concatenate([fill, current_ids.astype(mx.int64)], axis=-1)
+            embedding.prefetch(next_ids, history[:, -embedding.context_len :])
+            if not getattr(self, "_ple_lookahead_logged", False):
+                self._ple_lookahead_logged = True
+                logger.info("PLE gather-ahead active: next prefill chunk rows are gathered during the current chunk")
 
     def mtp_forward(
         self,

@@ -201,15 +201,9 @@ def test_qwen4_sparse_gqa_native_matches_fp32_gather_reference(
     selected_valid = mx.concatenate(
         (mx.ones(expanded.shape, dtype=mx.bool_), tail_valid), axis=-1
     )
-    key_rows = keys.transpose(0, 2, 1, 3)
-    value_rows = values.transpose(0, 2, 1, 3)
     safe = mx.where(selected_valid, selected, 0)
-    gathered_k = qsa_fast._batch_gather_tokens(key_rows, safe).transpose(
-        0, 1, 3, 2, 4
-    )
-    gathered_v = qsa_fast._batch_gather_tokens(value_rows, safe).transpose(
-        0, 1, 3, 2, 4
-    )
+    gathered_k = qsa_fast._gather_kv_rows(keys, safe)
+    gathered_v = qsa_fast._gather_kv_rows(values, safe)
     grouped_q = queries.transpose(0, 2, 1, 3).reshape(
         1, query_tokens, 2, 12, 256
     )
@@ -272,12 +266,8 @@ def test_qwen4_sparse_gqa_native_masks_future_blocks_in_first_chunk():
     selected_valid = mx.concatenate((expanded_valid, tail_valid), axis=-1)
     safe = mx.where(selected_valid, selected, 0)
 
-    gathered_k = qsa_fast._batch_gather_tokens(
-        keys.transpose(0, 2, 1, 3), safe
-    ).transpose(0, 1, 3, 2, 4)
-    gathered_v = qsa_fast._batch_gather_tokens(
-        values.transpose(0, 2, 1, 3), safe
-    ).transpose(0, 1, 3, 2, 4)
+    gathered_k = qsa_fast._gather_kv_rows(keys, safe)
+    gathered_v = qsa_fast._gather_kv_rows(values, safe)
     grouped_q = queries.transpose(0, 2, 1, 3).reshape(
         1, query_tokens, 2, 12, 256
     )

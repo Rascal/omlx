@@ -3580,6 +3580,7 @@ class VLMBatchedEngine(BaseEngine):
             vlm_cache_key_start=vlm_cache_key_start,
             vlm_cache_key_ranges=vlm_cache_key_ranges,
             tools=tools,
+            preserve_reasoning=bool(kwargs.get("preserve_reasoning", False)),
             **specprefill_kwargs,
         )
 

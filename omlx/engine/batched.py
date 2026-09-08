@@ -915,6 +915,7 @@ class BatchedEngine(BaseEngine):
             prompt=prompt,
             sampling_params=sampling_params,
             tools=tools,
+            preserve_reasoning=bool(kwargs.get("preserve_reasoning", False)),
             **specprefill_kwargs,
         )
 

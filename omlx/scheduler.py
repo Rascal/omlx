@@ -8756,6 +8756,10 @@ class Scheduler:
                 request.prompt_token_ids = list(request.prompt)
             request.num_prompt_tokens = len(request.prompt_token_ids)
 
+        if self.block_aware_cache is not None:
+            # Arm MTP boundary alignment now: a prompt shorter than a block meets
+            # its first boundary mid-decode, before any capture would arm it.
+            self._detect_boundary_snapshot_need()
         # Prefix-cache lookup is intentionally delayed until admission. That
         # lets a same-prefix request wait for a relevant in-flight store_cache
         # without blocking the scheduler lane that continues decode/prefill.

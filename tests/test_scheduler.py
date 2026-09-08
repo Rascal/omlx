@@ -3369,6 +3369,30 @@ class TestSchedulerBoundarySnapshots:
         assert scheduler._boundary_snapshot_required is True
         assert mock_model._omlx_mtp_commit_align == 4
 
+    def test_add_request_arms_mtp_boundary_alignment_before_decode(
+        self, mock_model, mock_tokenizer
+    ):
+        """A prompt shorter than a block meets its first boundary mid-decode, so the
+        MTP commit alignment must be armed at admission, not at the first capture."""
+        RotatingStub = type("RotatingKVCache", (), {})
+        mock_model.make_cache = lambda: [RotatingStub()]
+        scheduler = Scheduler(
+            model=mock_model,
+            tokenizer=mock_tokenizer,
+            config=SchedulerConfig(paged_cache_block_size=4),
+        )
+        scheduler.block_aware_cache = MagicMock()
+        request = Request(
+            request_id="req-short-prompt",
+            prompt="hello",
+            sampling_params=SamplingParams(),
+        )
+
+        scheduler.add_request(request)
+
+        assert scheduler._boundary_snapshot_required is True
+        assert mock_model._omlx_mtp_commit_align == 4
+
     def test_prefill_boundary_snapshot_ignores_non_boundary_token_count(
         self, mock_model, mock_tokenizer
     ):

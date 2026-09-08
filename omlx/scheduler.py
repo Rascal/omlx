@@ -7564,8 +7564,8 @@ class Scheduler:
         Parser-side stops (for example tool-call end markers) can finish a request
         after a normal streaming token response. That response has no
         ``prompt_cache``, so the usual final-response cache extraction never runs.
-        This fallback stores only prompt tokens up to a prefill block boundary,
-        never generated output tokens.
+        This fallback stores the prompt, plus the output when the next turn
+        keeps it (``_output_tokens_cacheable``), up to a block boundary.
         """
         if self.block_aware_cache is None:
             return None
@@ -7577,6 +7577,8 @@ class Scheduler:
             return None
 
         prompt_tokens = list(request.prompt_token_ids or [])
+        if _output_tokens_cacheable(request):
+            prompt_tokens += list(getattr(request, "output_token_ids", None) or [])
         boundary_len = (len(prompt_tokens) // block_size) * block_size
         if boundary_len <= 0:
             return None
@@ -7633,12 +7635,12 @@ class Scheduler:
                 model_cache_config = boundary_model_config
 
             logger.info(
-                "Using prompt boundary cache snapshot for %s: storing %s/%s prompt "
-                "tokens after scheduler-side stop (skipping output tokens, %s "
-                "intermediate snapshots)",
+                "Using prompt boundary cache snapshot for %s: storing %s/%s "
+                "tokens after scheduler-side stop (%s, %s intermediate snapshots)",
                 request_id,
                 len(token_sequence),
                 len(prompt_tokens),
+                "prompt + output" if _output_tokens_cacheable(request) else "prompt only",
                 len(intermediate_snapshots) if intermediate_snapshots else 0,
             )
             return (

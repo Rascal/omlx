@@ -1270,6 +1270,13 @@ class _BoundaryStoreUnavailable(Exception):
     """
 
 
+def _output_tokens_cacheable(request: "Request") -> bool:
+    """Output tokens are reusable unless the next turn drops a <think> block."""
+    return not getattr(request, "needs_think_prefix", False) or bool(
+        getattr(request, "preserve_reasoning", False)
+    )
+
+
 def _first_leaf_cache_offset(cache_obj: Any) -> int | None:
     """First integer ``offset`` found walking into composite caches.
 
@@ -7511,9 +7518,9 @@ class Scheduler:
         if self._boundary_cache_snapshots.get(request.request_id):
             return
         token_count = (
-            len(request.prompt_token_ids)
-            if request.needs_think_prefix
-            else request.num_tokens
+            request.num_tokens
+            if _output_tokens_cacheable(request)
+            else len(request.prompt_token_ids)
         )
         block_size = self.config.paged_cache_block_size
         if (
@@ -11580,13 +11587,12 @@ class Scheduler:
                                 ) = prompt_boundary_store
                                 cacheable_sequence = list(token_sequence_to_store)
                             else:
-                                # For reasoning models, only cache prompt tokens.
-                                # Output contains <think> tokens that the API layer
-                                # strips before the next turn, so they never match.
-                                if getattr(request, "needs_think_prefix", False):
-                                    cacheable_sequence = list(request.prompt_token_ids)
-                                else:
+                                if _output_tokens_cacheable(request):
                                     cacheable_sequence = full_token_sequence
+                                else:
+                                    # <think> output is stripped before the next
+                                    # turn, so it can never prefix-match.
+                                    cacheable_sequence = list(request.prompt_token_ids)
                                 token_sequence_to_store = cacheable_sequence
                                 cache_to_store = request._extracted_cache
                                 model_cache_config = getattr(

@@ -206,6 +206,7 @@ class Request:
 
     # Reasoning model support (for models with <think> tags)
     needs_think_prefix: bool = False  # True if prompt ends with <think> token
+    preserve_reasoning: bool = False  # history keeps the <think> output, so output tokens are cacheable
     think_prefix_sent: bool = False  # Track if prefix already sent
 
     # Harmony model support (gpt-oss models)

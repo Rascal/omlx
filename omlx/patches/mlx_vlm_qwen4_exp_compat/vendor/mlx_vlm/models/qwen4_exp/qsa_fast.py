@@ -36,17 +36,28 @@ def _nax_gpu() -> bool:
         return False
 
 
-@functools.lru_cache(maxsize=None)
-def _native_score_min_rows() -> int:
-    """Query rows from which the native indexer-score kernel engages; below it the
-    MLX ops are faster on NAX GPUs (0.27 vs 0.36-0.77 ms per layer at 1-16 rows)."""
-    raw = os.environ.get("OMLX_QWEN4_QSA_NATIVE_SCORE_MIN_ROWS", "").strip()
+def _min_rows(env: str, nax_default: int) -> int:
+    raw = os.environ.get(env, "").strip()
     if raw:
         try:
             return max(0, int(raw))
         except ValueError:
             pass
-    return 32 if _nax_gpu() else 0
+    return nax_default if _nax_gpu() else 0
+
+
+@functools.lru_cache(maxsize=None)
+def _native_score_min_rows() -> int:
+    """Query rows from which the native indexer-score kernel engages; below it the
+    MLX ops are faster on NAX GPUs (0.27 vs 0.36-0.77 ms per layer at 1-16 rows)."""
+    return _min_rows("OMLX_QWEN4_QSA_NATIVE_SCORE_MIN_ROWS", 32)
+
+
+@functools.lru_cache(maxsize=None)
+def _native_topk_min_rows() -> int:
+    """Query rows from which the native top-k engages; argpartition ties or wins
+    below it on NAX GPUs (0.26-0.31 vs 0.26 ms per layer at one row)."""
+    return _min_rows("OMLX_QWEN4_QSA_NATIVE_TOPK_MIN_ROWS", 8)
 
 
 def contiguous_causal_query_chunk(key_tokens: int) -> int:
@@ -246,6 +257,8 @@ def _native_topk_indices(scores: mx.array, topk: int) -> mx.array | None:
         or scores.dtype != mx.float32
         or topk != 512
     ):
+        return None
+    if scores.shape[1] < _native_topk_min_rows():
         return None
     try:
         from omlx.custom_kernels.glm_moe_dsa import fast

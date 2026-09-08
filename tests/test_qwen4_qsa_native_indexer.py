@@ -299,3 +299,55 @@ def _reset_native_score_gate():
     qsa_fast._native_score_min_rows.cache_clear()
     yield
     qsa_fast._native_score_min_rows.cache_clear()
+
+
+@pytest.fixture
+def fake_native_topk(monkeypatch):
+    seen = []
+
+    def topk(scores, *, topk):
+        seen.append(scores.shape)
+        return mx.zeros((1, scores.shape[1], topk), dtype=mx.uint32)
+
+    monkeypatch.setattr(fast, "is_native_available", lambda: True)
+    monkeypatch.setattr(fast, "has_symbol", lambda name: True)
+    monkeypatch.setattr(fast, "qwen4_qsa_topk_indices", topk)
+    monkeypatch.setattr(qsa_fast, "_NATIVE_QSA_TOPK_DISABLED", False)
+    monkeypatch.setattr(qsa_fast, "_NATIVE_QSA_TOPK_PROVEN", True)
+    monkeypatch.delenv("OMLX_QWEN4_QSA_NATIVE_TOPK_MIN_ROWS", raising=False)
+    qsa_fast._native_topk_min_rows.cache_clear()
+    yield seen
+    qsa_fast._native_topk_min_rows.cache_clear()
+
+
+def _topk_rows(rows):
+    return qsa_fast._native_topk_indices(mx.zeros((1, rows, 4096), dtype=mx.float32), 512)
+
+
+@pytest.mark.parametrize("rows", [1, 4])
+def test_native_topk_yields_to_argpartition_for_decode_rows_on_nax(monkeypatch, fake_native_topk, rows):
+    monkeypatch.setattr(qsa_fast, "_nax_gpu", lambda: True)
+    assert _topk_rows(rows) is None
+    assert fake_native_topk == []
+    assert qsa_fast._NATIVE_QSA_TOPK_DISABLED is False
+
+
+@pytest.mark.parametrize("rows", [8, 64, 2048])
+def test_native_topk_keeps_native_from_eight_rows_on_nax(monkeypatch, fake_native_topk, rows):
+    monkeypatch.setattr(qsa_fast, "_nax_gpu", lambda: True)
+    assert _topk_rows(rows) is not None
+    assert fake_native_topk == [(1, rows, 4096)]
+
+
+def test_native_topk_stays_native_for_decode_rows_off_nax(monkeypatch, fake_native_topk):
+    monkeypatch.setattr(qsa_fast, "_nax_gpu", lambda: False)
+    assert _topk_rows(1) is not None
+    assert fake_native_topk == [(1, 1, 4096)]
+
+
+def test_native_topk_min_rows_env_override(monkeypatch, fake_native_topk):
+    monkeypatch.setattr(qsa_fast, "_nax_gpu", lambda: True)
+    monkeypatch.setenv("OMLX_QWEN4_QSA_NATIVE_TOPK_MIN_ROWS", "0")
+    qsa_fast._native_topk_min_rows.cache_clear()
+    assert _topk_rows(1) is not None
+    assert fake_native_topk == [(1, 1, 4096)]

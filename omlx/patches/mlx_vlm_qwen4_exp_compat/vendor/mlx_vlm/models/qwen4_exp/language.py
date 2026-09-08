@@ -1880,7 +1880,8 @@ class _SafeTensorMMap:
     def tensor_dtype(self, key: str) -> str:
         return str(self._header[key]["dtype"])
 
-    def rows(self, key: str, rows: list[int]) -> mx.array:
+    def rows_np(self, key: str, rows) -> tuple[np.ndarray, str]:
+        """Copy the requested rows out of the mapping; returns the raw array and the safetensors dtype."""
         entry = self._header[key]
         shape = tuple(entry["shape"])
         start, end = entry["data_offsets"]
@@ -1899,33 +1900,37 @@ class _SafeTensorMMap:
             raise ValueError(f"Invalid sparse PLE tensor layout for {key}")
         row_indices = np.asarray(rows, dtype=np.intp)
         if row_indices.size == 0:
-            copied = np.empty((0, shape[1]), dtype=np_dtype)
-        else:
-            gather_start = None
-            if row_indices.size > 8:
-                fully_seen = self._prefetch_missing_pages(
-                    row_indices,
-                    self._data_start + start,
-                    shape[1] * item_size,
-                )
-                gather_start = time.perf_counter() if fully_seen else None
-            view = np.ndarray(
-                shape,
-                dtype=np_dtype,
-                buffer=self._mapping,
-                offset=self._data_start + start,
+            return np.empty((0, shape[1]), dtype=np_dtype), dtype
+        gather_start = None
+        if row_indices.size > 8:
+            fully_seen = self._prefetch_missing_pages(
+                row_indices,
+                self._data_start + start,
+                shape[1] * item_size,
             )
-            copied = np.array(view[row_indices], copy=True)
-            if gather_start is not None:
-                self._rearm_if_slow(
-                    time.perf_counter() - gather_start, row_indices.size
-                )
+            gather_start = time.perf_counter() if fully_seen else None
+        view = np.ndarray(
+            shape,
+            dtype=np_dtype,
+            buffer=self._mapping,
+            offset=self._data_start + start,
+        )
+        copied = np.array(view[row_indices], copy=True)
+        if gather_start is not None:
+            self._rearm_if_slow(time.perf_counter() - gather_start, row_indices.size)
+        return copied, dtype
+
+    @staticmethod
+    def to_mx(copied: np.ndarray, dtype: str) -> mx.array:
         if dtype == "BF16":
             values = (copied.astype(np.uint32) << np.uint32(16)).view(np.float32)
             return mx.array(values).astype(mx.bfloat16)
         if dtype == "F8_E4M3":
             return mx.from_fp8(mx.array(copied), dtype=mx.bfloat16)
         return mx.array(copied)
+
+    def rows(self, key: str, rows: list[int]) -> mx.array:
+        return self.to_mx(*self.rows_np(key, rows))
 
     def _prefetch_missing_pages(self, row_indices, base_offset, row_bytes) -> bool:
         """Prefetch unmarked pages; return whether all were already marked."""
@@ -2009,6 +2014,7 @@ class DiskBackedShardedEmbedding(nn.Module):
         self.weight_scale = mx.ones((1,), dtype=mx.bfloat16)
         self._prefix = prefix
         self.rows_read = 0
+        self.last_uploads = 0
         self.last_touched_shards: tuple[int, ...] = ()
         self._readers: dict[str, _SafeTensorMMap] = {}
         self._tensor_readers: dict[str, _SafeTensorMMap] = {}
@@ -2142,9 +2148,61 @@ class DiskBackedShardedEmbedding(nn.Module):
         shape = indices.shape
         flat = indices.reshape(-1)
         mx.eval(flat)
-        host_indices = [int(index) for index in flat.tolist()]
-        if any(index < 0 or index >= self.shard_offsets[-1] for index in host_indices):
+        host = np.asarray(flat.astype(mx.int64)).reshape(-1)
+        if host.size == 0:
+            return mx.zeros((*shape, self.dims), dtype=mx.bfloat16)
+        if int(host.min()) < 0 or int(host.max()) >= self.shard_offsets[-1]:
             raise IndexError("embedding index is outside the sharded vocabulary")
+        offsets = np.asarray(self.shard_offsets, dtype=np.int64)
+        shard = np.searchsorted(offsets, host, side="right") - 1
+        local = host - offsets[shard]
+        touched = [int(index) for index in np.unique(shard)]
+        self.last_touched_shards = tuple(touched)
+        self.rows_read = int(host.size)
+        specs = [self._shard_specs[index] for index in touched]
+        bits, group_size = specs[0][3], specs[0][4]
+        families = [0] if bits is None else [0, 1, 2]
+        dtypes = {
+            family: self._tensor_readers[specs[0][family]].tensor_dtype(specs[0][family])
+            for family in families
+        }
+        if any(spec[3:] != (bits, group_size) for spec in specs) or any(
+            self._tensor_readers[spec[family]].tensor_dtype(spec[family]) != dtypes[family]
+            for spec in specs
+            for family in families
+        ):
+            return self._gather_per_shard([int(index) for index in host], shape)
+        # Assemble every family's rows on the host in index order: one upload and
+        # one dequantize per chunk instead of one per touched shard.
+        buffers: dict[int, np.ndarray] = {}
+        for shard_index, spec in zip(touched, specs):
+            positions = np.flatnonzero(shard == shard_index)
+            rows = local[positions]
+            for family in families:
+                key = spec[family]
+                copied, _ = self._tensor_readers[key].rows_np(key, rows)
+                buffer = buffers.get(family)
+                if buffer is None:
+                    buffer = np.empty((host.size, copied.shape[1]), dtype=copied.dtype)
+                    buffers[family] = buffer
+                buffer[positions] = copied
+        arrays = [_SafeTensorMMap.to_mx(buffers[family], dtypes[family]) for family in families]
+        self.last_uploads = len(arrays)
+        values = arrays[0]
+        if bits is not None:
+            values = mx.dequantize(
+                values,
+                arrays[1],
+                arrays[2],
+                group_size=group_size,
+                bits=bits,
+                mode="affine",
+            )
+        values = values.astype(mx.bfloat16) * self.weight_scale
+        return values.reshape(*shape, self.dims)
+
+    def _gather_per_shard(self, host_indices: list[int], shape) -> mx.array:
+        """Fallback for tables whose touched shards differ in dtype or quantization."""
         shard_indices = [
             bisect_right(self.shard_offsets, index) - 1 for index in host_indices
         ]

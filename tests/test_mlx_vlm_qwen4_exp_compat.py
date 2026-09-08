@@ -1668,3 +1668,53 @@ def test_qwen4_lightning_mtp_isolated_from_dense_qwen35_runtime_patch():
 
     assert resident_owner.mtp is not None
     assert later_owner.mtp is not None
+
+
+def _disk_ple(tmp_path, *, shards, rows, dims, bits=None):
+    """Write a sharded PLE table (affine-packed when ``bits`` is set, else dense bf16) and open it from disk."""
+    compat.apply_mlx_vlm_qwen4_exp_compat_patch()
+    from mlx_vlm.models.qwen4_exp.language import DiskBackedShardedEmbedding
+
+    prefix = "model.language_model.layers.1.ple.ple_embedding.ngram_embedding"
+    tensors, dense_rows = {}, []
+    for shard_index in range(shards):
+        dense = (mx.random.normal((rows, dims)) * (shard_index + 1)).astype(mx.bfloat16)
+        base = f"{prefix}.shard_{shard_index}"
+        if bits is None:
+            tensors[f"{base}.weight"] = dense
+            dense_rows.append(dense)
+        else:
+            weight, scales, biases = mx.quantize(dense, group_size=32, bits=bits, mode="affine")
+            tensors[f"{base}.weight"], tensors[f"{base}.scales"], tensors[f"{base}.biases"] = weight, scales, biases
+            dense_rows.append(mx.dequantize(weight, scales, biases, group_size=32, bits=bits, mode="affine").astype(mx.bfloat16))
+    mx.eval(*tensors.values(), *dense_rows)
+    filename = "model-00001-of-00001.safetensors"
+    mx.save_safetensors(str(tmp_path / filename), tensors, metadata={"format": "mlx"})
+    (tmp_path / "model.safetensors.index.json").write_text(json.dumps({"weight_map": {key: filename for key in tensors}}), encoding="utf-8")
+    table = mx.concatenate(dense_rows)
+    return DiskBackedShardedEmbedding(tmp_path, prefix, num_embeddings=shards * rows, dims=dims, num_shards=shards), table
+
+
+@pytest.mark.parametrize("bits", [None, 4, 5])
+def test_disk_backed_ple_gathers_a_chunk_with_one_upload_per_tensor(tmp_path, bits):
+    """A chunk's rows are assembled on the host and uploaded once per tensor, not once per shard."""
+    embedding, table = _disk_ple(tmp_path, shards=3, rows=8, dims=64, bits=bits)
+    mx.random.seed(11)
+    indices = mx.random.randint(0, 24, (2, 40)).astype(mx.int32)
+    mx.eval(indices)
+    values = embedding(indices)
+    mx.eval(values)
+    expected = mx.take(table, indices.reshape(-1), axis=0).reshape(2, 40, 64)
+    assert values.dtype == mx.bfloat16
+    assert mx.array_equal(values, expected).item()
+    assert embedding.rows_read == 80
+    assert embedding.last_touched_shards == (0, 1, 2)
+    assert embedding.last_uploads == (1 if bits is None else 3)
+    embedding.close()
+
+
+def test_disk_backed_ple_rejects_out_of_range_indices(tmp_path):
+    embedding, _ = _disk_ple(tmp_path, shards=2, rows=4, dims=32, bits=4)
+    with pytest.raises(IndexError):
+        embedding(mx.array([[1, 8]], dtype=mx.int32))
+    embedding.close()

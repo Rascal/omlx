@@ -100,3 +100,23 @@ def test_qwen4_verify_gather_kill_switch_keeps_official_path(monkeypatch):
     monkeypatch.setattr(language, "_GATHERED_VERIFY_DISABLED", True)
     mx.eval(attention(mx.random.normal((1, 4, config.hidden_size)), mask="causal", cache=fast_cache, target_verify=True))
     assert calls == []
+
+
+def test_qwen4_verify_gather_requires_rank_two_positions():
+    """The adapter emits rank-two text positions only above the step threshold; the
+    verify arm must not engage on rank-three broadcast planes below it (measured
+    -14% adaptive tok/s at 4k when it did)."""
+    import mlx_vlm.models.qwen4_exp.language as language
+
+    config, attention, fast_cache, _ = _layer_and_prefix()
+    rows = 4
+    verify = mx.random.normal((1, rows, config.hidden_size))
+    text = mx.arange(fast_cache.offset, fast_cache.offset + rows)[None, :]
+    planes = mx.broadcast_to(text[None, :, :], (3, 1, rows))
+    eligible = lambda positions: attention._gathered_text_verify_eligible(
+        verify, "causal", fast_cache, positions, None, True
+    )
+    assert fast_cache.offset + rows > attention.indexer.token_budget
+    assert eligible(text) is True
+    assert eligible(None) is True
+    assert eligible(planes) is False

@@ -77,6 +77,20 @@ def _broadcast_text_mrope_position_ids(
     return same
 
 
+def _rank_two_text_position_ids(
+    position_ids: Optional[mx.array],
+    length: int,
+) -> bool:
+    """True for missing or ``(1, length)`` text ids only; no plane comparison."""
+    if position_ids is None:
+        return True
+    return (
+        isinstance(position_ids, mx.array)
+        and position_ids.ndim == 2
+        and tuple(position_ids.shape) == (1, length)
+    )
+
+
 def _gathered_min_query_tokens() -> int:
     """Keep narrow Lightning MTP windows on masked SDPA (M5 crossover)."""
     raw = os.environ.get("OMLX_QWEN4_GATHERED_MIN_QUERY", "").strip()
@@ -1347,8 +1361,8 @@ class Qwen4ExpAttention(Qwen3_5Attention):
         position_embeddings: Optional[tuple[mx.array, mx.array]],
         target_verify: bool,
     ) -> bool:
-        """Lightning MTP verify rows (batch-one text, aligned indexer) attend only
-        the selected blocks; rollback is unaffected (both arms append the same rows)."""
+        """Lightning MTP verify rows (batch-one text, rank-two positions, aligned
+        indexer) attend only the selected blocks; rollback is unaffected."""
 
         if _GATHERED_VERIFY_DISABLED or not target_verify:
             return False
@@ -1361,7 +1375,7 @@ class Qwen4ExpAttention(Qwen3_5Attention):
             and type(cache) is QSAKVCache
             and isinstance(cache.offset, int)
             and position_embeddings is None
-            and self._batch_one_text_position_ids(position_ids, x.shape[1])
+            and _rank_two_text_position_ids(position_ids, x.shape[1])
         ):
             return False
         if cache.offset:

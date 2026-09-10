@@ -22,6 +22,7 @@ IndexRoPE = Callable[[mx.array, mx.array], mx.array]
 
 _NATIVE_QSA_SCORE_DISABLED = False
 _NATIVE_QSA_SCORE_PROVEN = False
+_NATIVE_QSA_NAX_SCORES_DISABLED = False
 _NATIVE_QSA_TOPK_DISABLED = False
 _NATIVE_QSA_TOPK_PROVEN = False
 _NATIVE_QSA_MAIN_DISABLED = False
@@ -191,6 +192,24 @@ def pool_completed_index_keys(
     return apply_index_rope(pooled[:, None], pooled_positions)[:, 0]
 
 
+def _native_scores_kernel(fast):
+    """The tensor-unit score kernel on NAX GPUs (OMLX_QWEN4_QSA_NAX_SCORES=0 keeps
+    the steel kernel), else the steel kernel."""
+    global _NATIVE_QSA_NAX_SCORES_DISABLED
+    if (
+        not _NATIVE_QSA_NAX_SCORES_DISABLED
+        and os.environ.get("OMLX_QWEN4_QSA_NAX_SCORES", "").strip() != "0"
+        and fast.has_symbol("qwen4_qsa_nax_indexer_scores")
+    ):
+        try:
+            if fast.qwen4_qsa_nax_indexer_available():
+                return fast.qwen4_qsa_nax_indexer_scores
+        except Exception:
+            pass
+        _NATIVE_QSA_NAX_SCORES_DISABLED = True
+    return fast.qwen4_qsa_indexer_scores
+
+
 def _native_indexer_scores(
     queries: mx.array,
     pooled_keys: mx.array,
@@ -232,7 +251,7 @@ def _native_indexer_scores(
         # The caller's [B,M,H,D] view transposes back to the GEMM-friendly
         # [B,H,M,D] ABI. The native wrapper only copies when the resulting
         # view is not row-contiguous (for example an offset query chunk).
-        scores = fast.qwen4_qsa_indexer_scores(
+        scores = _native_scores_kernel(fast)(
             queries.transpose(0, 2, 1, 3),
             pooled_keys[:, None],
             mask_ratio=compress_ratio,

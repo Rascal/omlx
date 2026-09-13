@@ -52,6 +52,7 @@ from ..websearch import (
     run_web_search_test,
 )
 from ..websearch import SUPPORTED_PROVIDERS as SUPPORTED_WEB_SEARCH_PROVIDERS
+from .activity_rate import RecentRateTracker
 from .auth import (
     REMEMBER_ME_MAX_AGE,
     SESSION_MAX_AGE,
@@ -5745,6 +5746,10 @@ async def get_server_activity(is_admin: bool = Depends(require_admin)):
     return {"active_models": _build_active_models_data()}
 
 
+# Sampled once per poll; the window is the dashboard's live tok/s.
+_recent_rates = RecentRateTracker()
+
+
 def _build_active_models_data() -> dict:
     """Build active models status for the dashboard Active Models card."""
     from ..model_discovery import format_size
@@ -5772,6 +5777,7 @@ def _build_active_models_data() -> dict:
         }
 
     now = time.monotonic()
+    generating_ids: set[str] = set()
     tracker = get_prefill_tracker()
     status = engine_pool.get_status()
     enforcer = (
@@ -5902,12 +5908,17 @@ def _build_active_models_data() -> dict:
             tokens_per_second = (
                 generated_tokens / elapsed if elapsed and elapsed > 0 else 0.0
             )
+            recent_tokens_per_second = (
+                _recent_rates.observe(rid, now, generated_tokens) if req else None
+            )
+            generating_ids.add(rid)
             generating.append(
                 {
                     "request_id": rid,
                     "elapsed_seconds": elapsed,
                     "generated_tokens": generated_tokens,
                     "tokens_per_second": tokens_per_second,
+                    "recent_tokens_per_second": recent_tokens_per_second,
                     "last_activity_age_seconds": last_activity_age,
                     "prompt_tokens": getattr(req, "num_prompt_tokens", 0) if req else 0,
                     "max_tokens": getattr(req, "max_tokens", None) if req else None,
@@ -6070,6 +6081,7 @@ def _build_active_models_data() -> dict:
     else:
         memory_used = status.get("current_model_memory", 0)
         memory_max = status.get("final_ceiling", 0)
+    _recent_rates.prune(generating_ids)
     return {
         "models": models,
         "model_memory_used": memory_used,

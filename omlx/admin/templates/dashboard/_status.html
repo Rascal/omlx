@@ -309,8 +309,8 @@
                                                         <span class="text-[10px] text-green-600 font-medium" x-text="window.t('status.active_models.generating')"></span>
                                                     </span>
                                                     <span class="text-[10px] text-neutral-400 w-16 whitespace-nowrap ml-2" x-text="formatTokenCount(gen.generated_tokens || 0) + ' tok'"></span>
-                                                    <span x-show="gen.tokens_per_second > 0" class="text-[10px] text-neutral-400 w-20 whitespace-nowrap"
-                                                          x-text="gen.tokens_per_second.toFixed(1) + ' tok/s'"></span>
+                                                    <span x-show="(gen.recent_tokens_per_second != null ? gen.recent_tokens_per_second : gen.tokens_per_second) > 0" class="text-[10px] text-neutral-400 w-20 whitespace-nowrap"
+                                                          x-text="(gen.recent_tokens_per_second != null ? gen.recent_tokens_per_second : gen.tokens_per_second).toFixed(1) + ' tok/s'"></span>
                                                     <span x-show="gen.last_activity_age_seconds >= 3" class="text-[10px] text-neutral-400 whitespace-nowrap" x-text="formatActivityAge(gen.last_activity_age_seconds)"></span>
                                                     <span x-show="gen.elapsed_seconds != null" class="text-[10px] text-neutral-400 whitespace-nowrap"
                                                           x-text="formatDurationShort(gen.elapsed_seconds)"></span>

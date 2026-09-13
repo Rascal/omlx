@@ -4,6 +4,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from omlx.admin import routes as admin_routes
+from omlx.admin.activity_rate import RecentRateTracker
 
 
 class FakePool:
@@ -91,6 +92,7 @@ def test_active_models_generation_includes_activity_and_waiting_rows():
             "elapsed_seconds": 10.0,
             "generated_tokens": 20,
             "tokens_per_second": 2.0,
+            "recent_tokens_per_second": None,
             "last_activity_age_seconds": 0.5,
             "prompt_tokens": 12,
             "max_tokens": 64,
@@ -616,3 +618,42 @@ def test_dflash_dashboard_localizes_metrics_and_shows_session_fallbacks():
     for locale_path in i18n_dir.glob("*.json"):
         locale = json.loads(locale_path.read_text(encoding="utf-8"))
         assert not keys - locale.keys(), f"{locale_path.name} is missing DFlash keys"
+
+
+def test_generating_rows_report_recent_rate_after_two_polls():
+    running_request = SimpleNamespace(
+        request_id="gen-1",
+        generation_started_at=100.0,
+        last_activity_at=109.5,
+        num_output_tokens=200,
+        num_prompt_tokens=12,
+        max_tokens=512,
+    )
+    scheduler = SimpleNamespace(
+        snapshot_for_admin=lambda: {
+            "running_by_id": {"gen-1": running_request},
+            "waiting": [],
+        },
+    )
+    tracker = RecentRateTracker(window_seconds=3.0, min_span_seconds=1.0)
+
+    def build(now):
+        with (
+            patch.object(admin_routes, "_get_engine_pool", return_value=FakePool(scheduler)),
+            patch("omlx.admin.routes._get_server_state", return_value=None),
+            patch.object(admin_routes, "_get_settings_manager", return_value=None),
+            patch.object(admin_routes, "_get_global_settings", return_value=None),
+            patch("omlx.prefill_progress.get_prefill_tracker", return_value=FakePrefillTracker()),
+            patch.object(admin_routes, "_recent_rates", tracker),
+            patch("time.monotonic", return_value=now),
+        ):
+            return admin_routes._build_active_models_data()["models"][0]["generating"][0]
+
+    first = build(110.0)
+    running_request.num_output_tokens = 260
+    second = build(112.0)
+
+    assert first["recent_tokens_per_second"] is None
+    assert first["tokens_per_second"] == 20.0
+    assert second["recent_tokens_per_second"] == 30.0  # 60 tokens over the last 2 s
+    assert second["tokens_per_second"] == 260 / 12.0  # lifetime average is untouched
